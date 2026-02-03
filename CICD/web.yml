@@ -1,0 +1,147 @@
+name: deploy-web
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - ".github/workflows/deploy-web.yml"
+      - "web/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build_push_deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+      RESOURCE_GROUP: ${{ secrets.RESOURCE_GROUP }}
+      WEB_APP_NAME: ${{ secrets.WEB_APP_NAME }}
+      SLOT_NAME: ${{ secrets.SLOT_NAME }}
+
+    steps:
+      - name: Clone Toptal GitLab repository
+        run: |
+          set -euo pipefail
+          git clone "https://${{ secrets.TOPTAL_GITLAB_USER }}:${{ secrets.TOPTAL_GITLAB_TOKEN }}@git.azure-3-tier.com/screening-ops/Sridath-jeelugula.git" repo
+          cd repo
+          git checkout main
+          ls -la
+
+      - name: Azure login (SPN)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: ACR login
+        run: |
+          set -euo pipefail
+          az acr login --name "${ACR_LOGIN_SERVER%%.*}"
+
+      - name: Build & push Web image
+        run: |
+          set -euo pipefail
+          IMAGE="$ACR_LOGIN_SERVER/azure-3-tier-web:${GITHUB_SHA}"
+          echo "Building $IMAGE"
+          docker build -t "$IMAGE" -f repo/web/Dockerfile repo/web
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy Web container (slot if provided)
+        run: |
+          set -euo pipefail
+          echo "Deploying $IMAGE"
+
+          if [ -n "${SLOT_NAME:-}" ]; then
+            echo "Deploying to slot: $SLOT_NAME"
+            az webapp config container set \
+              -g "$RESOURCE_GROUP" \
+              -n "$WEB_APP_NAME" \
+              --slot "$SLOT_NAME" \
+              --container-image-name "$IMAGE" \
+              --container-registry-url "https://$ACR_LOGIN_SERVER"
+          else
+            echo "Deploying to production slot"
+            az webapp config container set \
+              -g "$RESOURCE_GROUP" \
+              -n "$WEB_APP_NAME" \
+              --container-image-name "$IMAGE" \
+              --container-registry-url "https://$ACR_LOGIN_SERVER"
+          fi
+
+      - name: Restart Web (pick up new image)
+        run: |
+          set -euo pipefail
+          if [ -n "${SLOT_NAME:-}" ]; then
+            az webapp restart -g "$RESOURCE_GROUP" -n "$WEB_APP_NAME" --slot "$SLOT_NAME"
+          else
+            az webapp restart -g "$RESOURCE_GROUP" -n "$WEB_APP_NAME"
+          fi
+
+      - name: Health check Web (staging first)
+        run: |
+          set -euo pipefail
+
+          if [ -n "${SLOT_NAME:-}" ]; then
+            URL="https://${WEB_APP_NAME}-${SLOT_NAME}.azurewebsites.net/health"
+          else
+            URL="https://${WEB_APP_NAME}.azurewebsites.net/health"
+          fi
+
+          echo "Checking $URL"
+          for i in {1..60}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "Attempt $i -> HTTP $code"
+            if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+              echo "Web healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "Web did not become healthy. Dumping container config + recent logs..."
+          if [ -n "${SLOT_NAME:-}" ]; then
+            az webapp config container show -g "$RESOURCE_GROUP" -n "$WEB_APP_NAME" --slot "$SLOT_NAME" -o jsonc || true
+            az webapp log config -g "$RESOURCE_GROUP" -n "$WEB_APP_NAME" --slot "$SLOT_NAME" --docker-container-logging filesystem || true
+            timeout 60s az webapp log tail -g "$RESOURCE_GROUP" -n "$WEB_APP_NAME" --slot "$SLOT_NAME" || true
+          else
+            az webapp config container show -g "$RESOURCE_GROUP" -n "$WEB_APP_NAME" -o jsonc || true
+            az webapp log config -g "$RESOURCE_GROUP" -n "$WEB_APP_NAME" --docker-container-logging filesystem || true
+            timeout 60s az webapp log tail -g "$RESOURCE_GROUP" -n "$WEB_APP_NAME" || true
+          fi
+
+          exit 1
+
+      - name: Swap slot to production (zero downtime)
+        if: ${{ env.SLOT_NAME != '' }}
+        run: |
+          set -euo pipefail
+          echo "Swapping slot '$SLOT_NAME' -> production"
+          az webapp deployment slot swap \
+            -g "$RESOURCE_GROUP" \
+            -n "$WEB_APP_NAME" \
+            --slot "$SLOT_NAME" \
+            --target-slot production
+
+      - name: Health check Web (production after swap)
+        if: ${{ env.SLOT_NAME != '' }}
+        run: |
+          set -euo pipefail
+          URL="https://${WEB_APP_NAME}.azurewebsites.net/health"
+          echo "Checking $URL"
+
+          for i in {1..60}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "Attempt $i -> HTTP $code"
+            if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+              echo "Production healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "Production did not become healthy after swap"
+          exit 1
+

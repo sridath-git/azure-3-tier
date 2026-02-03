@@ -1,0 +1,137 @@
+name: deploy-api
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "api/**"
+      - ".github/workflows/deploy-api.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build_push_deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+      RESOURCE_GROUP: ${{ secrets.RESOURCE_GROUP }}
+      API_APP_NAME: ${{ secrets.API_APP_NAME }}
+      SLOT_NAME: staging
+
+    steps:
+      - name: Clone Toptal GitLab repository
+        run: |
+          set -euo pipefail
+          git clone "https://${{ secrets.TOPTAL_GITLAB_USER }}:${{ secrets.TOPTAL_GITLAB_TOKEN }}@git.azure-3-tier.com/screening-ops/Sridath-jeelugula.git" repo
+          cd repo
+          git checkout main
+          ls -la
+
+      - name: Azure login (SPN)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: ACR login
+        run: |
+          set -euo pipefail
+          ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
+          az acr login --name "$ACR_NAME"
+
+      - name: Build & push API image
+        run: |
+          set -euo pipefail
+          IMAGE="$ACR_LOGIN_SERVER/azure-3-tier-api:${GITHUB_SHA}"
+          echo "Building & pushing $IMAGE"
+          docker build -t "$IMAGE" repo/api
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy API container to staging slot
+        run: |
+          set -euo pipefail
+          echo "Deploying $IMAGE to ${API_APP_NAME}/${SLOT_NAME}"
+
+          az webapp config container set \
+            -g "$RESOURCE_GROUP" \
+            -n "$API_APP_NAME" \
+            --slot "$SLOT_NAME" \
+            --container-image-name "$IMAGE" \
+            --container-registry-url "https://$ACR_LOGIN_SERVER"
+
+      - name: Restart API staging slot (pick new image)
+        run: |
+          set -euo pipefail
+          az webapp restart -g "$RESOURCE_GROUP" -n "$API_APP_NAME" --slot "$SLOT_NAME"
+
+      - name: Show container settings (staging)
+        run: |
+          set -euo pipefail
+          az webapp config container show \
+            -g "$RESOURCE_GROUP" \
+            -n "$API_APP_NAME" \
+            --slot "$SLOT_NAME" \
+            -o jsonc
+
+      - name: Enable App Service logging (staging)
+        run: |
+          set -euo pipefail
+          az webapp log config \
+            -g "$RESOURCE_GROUP" \
+            -n "$API_APP_NAME" \
+            --slot "$SLOT_NAME" \
+            --docker-container-logging filesystem \
+            --level information
+
+      - name: Health check API (staging)
+        run: |
+          set -euo pipefail
+          URL="https://${API_APP_NAME}-${SLOT_NAME}.azurewebsites.net/health"
+          echo "Checking $URL"
+
+          for i in {1..60}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "Attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "API healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "API did not become healthy. Tailing logs..."
+          az webapp log config -g "$RESOURCE_GROUP" -n "$API_APP_NAME" --slot "$SLOT_NAME" --docker-container-logging filesystem || true
+          timeout 60s az webapp log tail -g "$RESOURCE_GROUP" -n "$API_APP_NAME" --slot "$SLOT_NAME" || true
+          exit 1
+
+      - name: Swap staging -> production (zero downtime)
+        run: |
+          set -euo pipefail
+          az webapp deployment slot swap \
+            -g "$RESOURCE_GROUP" \
+            -n "$API_APP_NAME" \
+            --slot "$SLOT_NAME" \
+            --target-slot production
+
+      - name: Health check API (production after swap)
+        run: |
+          set -euo pipefail
+          URL="https://${API_APP_NAME}.azurewebsites.net/health"
+          echo "Checking $URL"
+
+          for i in {1..60}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "Attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "Production API healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "Production API did not become healthy after swap"
+          exit 1
+
